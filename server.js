@@ -610,6 +610,18 @@ app.post('/webhook-ai', webhookLimiter, async (req, res) => {
 
     const tags = Array.isArray(body.tags) ? body.tags.slice(0, 5).map(t => String(t).substring(0, 20)) : [];
 
+    // Dedup: reject if same symbol + direction fired in last 4 hours
+    const dedupeWindowMs = 4 * 60 * 60 * 1000;
+    const recentDuplicate = aiSignals.find(s =>
+      s.symbol === symbol.substring(0, 20) &&
+      s.type === type &&
+      (Date.now() - new Date(s.time).getTime()) < dedupeWindowMs
+    );
+    if (recentDuplicate) {
+      console.log(`[DEDUP] Rejected duplicate AI ${type} for ${symbol}`);
+      return res.json({ success: true, deduplicated: true });
+    }
+
     const aiSignal = {
       id:         Date.now() + Math.floor(Math.random()*1000),
       symbol:     symbol.substring(0, 20),
