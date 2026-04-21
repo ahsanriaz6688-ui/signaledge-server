@@ -52,7 +52,26 @@ app.use(generalLimiter);
 const signals     = []; // Institutional OB signals
 const aiSignals   = []; // AI (RSI/MACD/Vol/Breakout) signals
 const priceCache  = {};
-let   marketScan  = { coins: {}, updatedAt: 0 }; // NEW: real tags for top 200
+let   marketScan  = { coins: {}, updatedAt: 0 }; // Real tags for top 200
+
+// Waitlist (in-memory; copy to DB when ready)
+const waitlist = []; // { email, phone, ts, ip }
+const waitlistEmails = new Set(); // dedupe
+
+// Stats tracking
+const stats = {
+  startTs: Date.now(),
+  scanCount: 0,       // incremented on every /webhook-scan
+  totalSignalsFired: 0,
+  signalsToday: 0,
+  todayStartTs: Date.now()
+};
+
+// Reset daily counter every 24h
+setInterval(() => {
+  stats.signalsToday = 0;
+  stats.todayStartTs = Date.now();
+}, 24 * 60 * 60 * 1000);
 
 // ══════════════════════════════════════════
 // HEALTH CHECK
@@ -60,12 +79,19 @@ let   marketScan  = { coins: {}, updatedAt: 0 }; // NEW: real tags for top 200
 app.get('/', (req, res) => {
   res.json({
     status:        'SignalEdge API running',
-    version:       '5.0.0',
-    features:      ['multi-timeframe', 'scalp', 'day', 'swing', 'position', 'ai-signals', 'market-scan'],
+    version:       '6.0.0',
+    features:      ['multi-timeframe', 'scalp', 'day', 'swing', 'position', 'ai-signals', 'market-scan', 'waitlist', 'signal-history'],
     signals:       signals.length,
     ai_signals:    aiSignals.length,
     market_coins:  Object.keys(marketScan.coins).length,
-    market_age_s:  marketScan.updatedAt ? Math.round((Date.now() - marketScan.updatedAt) / 1000) : null
+    market_age_s:  marketScan.updatedAt ? Math.round((Date.now() - marketScan.updatedAt) / 1000) : null,
+    stats: {
+      signals_today:  stats.signalsToday,
+      total_signals:  stats.totalSignalsFired,
+      scans_completed: stats.scanCount,
+      uptime_hours:   Math.round((Date.now() - stats.startTs) / 3600000),
+      subscribers:    waitlist.length
+    }
   });
 });
 
@@ -176,8 +202,56 @@ app.get('/api/ai-signals', (req, res) => {
 });
 
 // ══════════════════════════════════════════
-// GET MARKET SCAN (Real BUY/SELL/HOLD tags for top 200)
-// Returns: { coins: { BTC: {signal:'buy', rsi:32, vol_surge:true}, ... }, updatedAt }
+// WAITLIST (email + optional phone for alerts)
+// ══════════════════════════════════════════
+app.post('/api/waitlist', (req, res) => {
+  try {
+    const body = req.body || {};
+    const email = String(body.email || '').trim().toLowerCase().substring(0, 200);
+    const phone = String(body.phone || '').trim().substring(0, 30);
+
+    // Basic email validation
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: 'Valid email required' });
+    }
+
+    // Dedupe — if email exists, update phone if new one given
+    if (waitlistEmails.has(email)) {
+      if (phone) {
+        const existing = waitlist.find(w => w.email === email);
+        if (existing && !existing.phone) existing.phone = phone;
+      }
+      return res.json({ success: true, already_registered: true });
+    }
+
+    const entry = {
+      email,
+      phone: phone || null,
+      ts: new Date().toISOString(),
+      ip: req.headers['x-forwarded-for'] || req.ip || null
+    };
+    waitlist.push(entry);
+    waitlistEmails.add(email);
+
+    console.log(`[ALERTS] +${email}${phone ? ' (+phone)' : ''} → total subscribers: ${waitlist.length}`);
+    res.json({ success: true });
+  } catch(err) {
+    console.error('Waitlist error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Admin-only subscriber export (protected by WEBHOOK_SECRET)
+app.get('/api/subscribers-export', (req, res) => {
+  const auth = req.query.secret || req.headers['x-admin-secret'];
+  if (!auth || auth !== WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  res.json({ count: waitlist.length, entries: waitlist });
+});
+
+// ══════════════════════════════════════════
+// GET MARKET SCAN (Real BUY/SELL/NEUTRAL tags for top 200)
 // ══════════════════════════════════════════
 app.get('/api/market-scan', (req, res) => {
   res.json(marketScan);
@@ -205,12 +279,14 @@ app.post('/webhook-scan', webhookLimiter, (req, res) => {
         signal,
         rsi:        Math.min(Math.max(parseFloat(data.rsi) || 50, 0), 100),
         vol_surge:  !!data.vol_surge,
+        vol_ratio:  Math.min(Math.max(parseFloat(data.vol_ratio) || 1.0, 0), 99),
         strength:   Math.min(Math.max(parseInt(data.strength) || 0, 0), 100)
       };
       count++;
     }
     marketScan = { coins: cleaned, updatedAt: Date.now() };
-    console.log(`[SCAN] Market scan updated — ${count} coins`);
+    stats.scanCount++;
+    console.log(`[SCAN] Market scan updated — ${count} coins (total scans: ${stats.scanCount})`);
     res.json({ success: true, count });
   } catch(err) {
     console.error('Scan webhook error:', err.message);
@@ -260,6 +336,8 @@ app.post('/webhook', webhookLimiter, async (req, res) => {
 
     signals.unshift(signal);
     if (signals.length > 100) signals.pop();
+    stats.totalSignalsFired++;
+    stats.signalsToday++;
 
     // Push notification
     if (ONESIGNAL_API_KEY && ONESIGNAL_APP_ID) {
@@ -316,6 +394,10 @@ app.post('/webhook-ai', webhookLimiter, async (req, res) => {
       symbol:     symbol.substring(0, 20),
       type,
       price,
+      entry:      parseFloat(body.entry) || price,
+      sl:         parseFloat(body.sl)  || 0,
+      tp1:        parseFloat(body.tp1) || 0,
+      tp2:        parseFloat(body.tp2) || 0,
       confidence: Math.min(Math.max(parseInt(body.confidence) || 65, 0), 100),
       tags,
       reason:     (body.reason || '').toString().substring(0, 200),
@@ -327,6 +409,8 @@ app.post('/webhook-ai', webhookLimiter, async (req, res) => {
 
     aiSignals.unshift(aiSignal);
     if (aiSignals.length > 100) aiSignals.pop();
+    stats.totalSignalsFired++;
+    stats.signalsToday++;
 
     console.log(`[AI] ${type.toUpperCase()} ${symbol} @ ${price} | ${aiSignal.confidence}% | ${tags.join(',')}`);
     res.json({ success: true, signal: aiSignal });
@@ -350,7 +434,7 @@ app.use((err, req, res, next) => {
 // ══════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`SignalEdge API v5.0 running on port ${PORT}`);
+  console.log(`SignalEdge API v6.0 running on port ${PORT}`);
   console.log(`CORS allowed origin: ${ALLOWED_ORIGIN}`);
   console.log(`Finnhub:      ${FINNHUB_KEY ? '✓' : '✗'}`);
   console.log(`OneSignal:    ${ONESIGNAL_API_KEY ? '✓' : '✗'}`);
