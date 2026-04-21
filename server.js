@@ -326,14 +326,16 @@ app.get('/api/crypto', priceLimiter, async (req, res) => {
 // Returns: symbol, name, price, 24h %, volume, marketcap, sparkline
 // ══════════════════════════════════════════
 app.get('/api/markets', priceLimiter, async (req, res) => {
+  // Serve fresh cache (< 60s old)
+  if (priceCache['_markets'] && Date.now() - priceCache['_markets'].ts < 60000) {
+    return res.json(priceCache['_markets'].data);
+  }
   try {
-    if (priceCache['_markets'] && Date.now() - priceCache['_markets'].ts < 60000) {
-      return res.json(priceCache['_markets'].data);
-    }
     const r = await fetch(
       'https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=200&page=1&sparkline=true&price_change_percentage=24h',
       { timeout: 12000 }
     );
+    if (!r.ok) throw new Error(`CG ${r.status}`);
     const arr = await r.json();
     if (!Array.isArray(arr)) throw new Error('Bad CG response');
     const coins = arr.map(c => ({
@@ -352,6 +354,11 @@ app.get('/api/markets', priceLimiter, async (req, res) => {
     res.json(result);
   } catch(err) {
     console.error('Markets error:', err.message);
+    // ⬅️ Serve stale cache if available (even 1 hour old is better than nothing)
+    if (priceCache['_markets'] && priceCache['_markets'].data) {
+      console.log('[MARKETS] Serving stale cache due to CG failure');
+      return res.json({ ...priceCache['_markets'].data, stale: true });
+    }
     res.status(500).json({ error: 'Failed to fetch markets', coins: [] });
   }
 });
@@ -702,4 +709,43 @@ app.listen(PORT, () => {
   console.log(`Data dir:     ${DATA_READY ? '✓ ' + (fs.existsSync(DATA_DIR) ? DATA_DIR : '/tmp/signaledge-data') : '✗'}`);
   console.log(`Subscribers:  ${waitlist.length}`);
   console.log(`History:      ${signalHistory.length} signals`);
+
+  // Preload markets cache on startup — eliminates cold-start blank state
+  setTimeout(async () => {
+    try {
+      const r = await fetch('https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=200&page=1&sparkline=true&price_change_percentage=24h', { timeout: 12000 });
+      if (r.ok) {
+        const arr = await r.json();
+        if (Array.isArray(arr)) {
+          const coins = arr.map(c => ({
+            symbol: (c.symbol || '').toUpperCase(), name: c.name, price: c.current_price,
+            change24h: +(c.price_change_percentage_24h || 0).toFixed(2), volume: c.total_volume,
+            marketcap: c.market_cap, rank: c.market_cap_rank, image: c.image,
+            sparkline: (c.sparkline_in_7d && c.sparkline_in_7d.price) ? c.sparkline_in_7d.price.filter((_,i)=>i%4===0) : []
+          }));
+          priceCache['_markets'] = { data: { coins, timestamp: Date.now() }, ts: Date.now() };
+          console.log(`[STARTUP] Preloaded ${coins.length} coins into markets cache`);
+        }
+      }
+    } catch(e) { console.warn('[STARTUP] Market preload failed:', e.message); }
+  }, 2000);
+
+  // Refresh markets cache every 90s in background so users always get fresh data
+  setInterval(async () => {
+    try {
+      const r = await fetch('https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=200&page=1&sparkline=true&price_change_percentage=24h', { timeout: 12000 });
+      if (r.ok) {
+        const arr = await r.json();
+        if (Array.isArray(arr)) {
+          const coins = arr.map(c => ({
+            symbol: (c.symbol || '').toUpperCase(), name: c.name, price: c.current_price,
+            change24h: +(c.price_change_percentage_24h || 0).toFixed(2), volume: c.total_volume,
+            marketcap: c.market_cap, rank: c.market_cap_rank, image: c.image,
+            sparkline: (c.sparkline_in_7d && c.sparkline_in_7d.price) ? c.sparkline_in_7d.price.filter((_,i)=>i%4===0) : []
+          }));
+          priceCache['_markets'] = { data: { coins, timestamp: Date.now() }, ts: Date.now() };
+        }
+      }
+    } catch(e) {}
+  }, 90000);
 });
