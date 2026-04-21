@@ -93,6 +93,10 @@ const waitlistEmails = new Set(); // dedupe
 // Signal history (persisted, auto-tracked)
 const signalHistory = []; // { id, type, symbol, entry, sl, tp1, tp2, status, opened_at, closed_at, engine }
 
+// Fundamentals data (persisted, hourly-updated by bot)
+let fundamentals = { coins: [], updatedAt: 0 };
+const FUNDAMENTALS_FILE = path.join(DATA_DIR, 'fundamentals.json');
+
 // Stats tracking
 const stats = {
   startTs: Date.now(),
@@ -158,6 +162,27 @@ function loadHistory() {
 
 loadSubscribers();
 loadHistory();
+
+function saveFundamentals() {
+  if (!DATA_READY) return;
+  try {
+    fs.writeFileSync(FUNDAMENTALS_FILE, JSON.stringify(fundamentals, null, 2));
+  } catch(e) { console.error('[PERSIST] Fundamentals save failed:', e.message); }
+}
+
+function loadFundamentals() {
+  if (!DATA_READY) return;
+  try {
+    if (fs.existsSync(FUNDAMENTALS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(FUNDAMENTALS_FILE, 'utf-8'));
+      if (data && Array.isArray(data.coins)) {
+        fundamentals = data;
+        console.log(`[PERSIST] Loaded ${fundamentals.coins.length} fundamental scores from disk`);
+      }
+    }
+  } catch(e) { console.error('[PERSIST] Fundamentals load failed:', e.message); }
+}
+loadFundamentals();
 
 // ══════════════════════════════════════════
 // TWILIO SMS
@@ -253,7 +278,9 @@ app.get('/', (req, res) => {
       subscribers:     waitlist.length,
       history_count:   signalHistory.length,
       wins, losses: closed.length - wins,
-      win_rate:        winRate
+      win_rate:        winRate,
+      fundamentals_count: (fundamentals.coins || []).length,
+      fundamentals_age_min: fundamentals.updatedAt ? Math.round((Date.now() - fundamentals.updatedAt) / 60000) : null
     },
     integrations: {
       finnhub:   !!FINNHUB_KEY,
@@ -492,6 +519,74 @@ app.post('/webhook-scan', webhookLimiter, (req, res) => {
     res.json({ success: true, count });
   } catch(err) {
     console.error('Scan webhook error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ══════════════════════════════════════════
+// GET FUNDAMENTALS (frontend reads this)
+// ══════════════════════════════════════════
+app.get('/api/fundamentals', (req, res) => {
+  const ageMs = fundamentals.updatedAt ? (Date.now() - fundamentals.updatedAt) : null;
+  res.json({
+    coins: fundamentals.coins || [],
+    updatedAt: fundamentals.updatedAt,
+    age_minutes: ageMs ? Math.round(ageMs / 60000) : null,
+    count: (fundamentals.coins || []).length
+  });
+});
+
+// ══════════════════════════════════════════
+// POST FUNDAMENTALS (Bot uploads scored coins here, in chunks)
+// ══════════════════════════════════════════
+app.post('/webhook-fundamentals', webhookLimiter, (req, res) => {
+  try {
+    const body = req.body || {};
+    if (!body.secret || body.secret !== WEBHOOK_SECRET)
+      return res.status(401).json({ error: 'Unauthorized' });
+    if (!Array.isArray(body.coins))
+      return res.status(400).json({ error: 'Missing coins array' });
+
+    // Merge chunk into existing fundamentals by symbol
+    const now = Date.now();
+    const bySymbol = {};
+    // Index existing
+    (fundamentals.coins || []).forEach(c => { if (c.symbol) bySymbol[c.symbol] = c; });
+
+    // Apply incoming chunk (overwrites existing entries with same symbol)
+    let updated = 0;
+    for (const c of body.coins) {
+      if (!c || !c.symbol) continue;
+      const sym = String(c.symbol).toUpperCase().substring(0, 12);
+      bySymbol[sym] = {
+        symbol:    sym,
+        name:      (c.name || '').toString().substring(0, 60),
+        rank:      parseInt(c.rank) || null,
+        mcap:      parseFloat(c.mcap) || 0,
+        price:     parseFloat(c.price) || 0,
+        score:     Math.min(Math.max(parseFloat(c.score) || 0, 0), 100),
+        breakdown: (typeof c.breakdown === 'object' && c.breakdown !== null) ? c.breakdown : {},
+        has_tvl:   !!c.has_tvl,
+        updated_at: c.updated_at || new Date().toISOString()
+      };
+      updated++;
+    }
+
+    // Rebuild sorted array (by rank ascending, missing ranks last)
+    fundamentals = {
+      coins: Object.values(bySymbol).sort((a, b) => {
+        const ar = a.rank || 99999;
+        const br = b.rank || 99999;
+        return ar - br;
+      }),
+      updatedAt: now
+    };
+    saveFundamentals();
+
+    console.log(`[FUND] Received ${updated} coins — total stored: ${fundamentals.coins.length}`);
+    res.json({ success: true, received: updated, total: fundamentals.coins.length });
+  } catch(err) {
+    console.error('Fundamentals webhook error:', err.message);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
