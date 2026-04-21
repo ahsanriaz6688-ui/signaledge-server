@@ -63,11 +63,18 @@ app.use(cors({
 app.use(express.json({ limit: '500kb' })); // Bumped for market-scan payloads
 
 const generalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, max: 200,
-  message: { error: 'Too many requests' }
+  windowMs: 15 * 60 * 1000, max: 1000,
+  message: { error: 'Too many requests — please wait a minute and try again.' },
+  standardHeaders: true, legacyHeaders: false
 });
-const priceLimiter = rateLimit({ windowMs: 60 * 1000, max: 30, message: { error: 'Rate limit' } });
+const priceLimiter = rateLimit({ windowMs: 60 * 1000, max: 60, message: { error: 'Rate limit' } });
 const webhookLimiter = rateLimit({ windowMs: 60 * 1000, max: 300, message: { error: 'Webhook rate limit' } });
+// Waitlist: 10 signups per IP per hour (prevents spam but allows retries)
+const waitlistLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, max: 10,
+  message: { error: 'Too many signup attempts. Please try again in an hour.' },
+  standardHeaders: true, legacyHeaders: false
+});
 
 app.use(generalLimiter);
 
@@ -391,7 +398,7 @@ app.get('/api/ai-signals', (req, res) => {
 // ══════════════════════════════════════════
 // WAITLIST (email + optional phone for alerts)
 // ══════════════════════════════════════════
-app.post('/api/waitlist', (req, res) => {
+app.post('/api/waitlist', waitlistLimiter, (req, res) => {
   try {
     const body = req.body || {};
     const email = String(body.email || '').trim().toLowerCase().substring(0, 200);
@@ -467,7 +474,7 @@ app.post('/webhook-scan', webhookLimiter, (req, res) => {
         signal,
         rsi:        Math.min(Math.max(parseFloat(data.rsi) || 50, 0), 100),
         vol_surge:  !!data.vol_surge,
-        vol_ratio:  Math.min(Math.max(parseFloat(data.vol_ratio) || 1.0, 0), 99),
+        vol_ratio:  Math.min(Math.max(parseFloat(data.vol_ratio) || 1.0, 0), 50),
         strength:   Math.min(Math.max(parseInt(data.strength) || 0, 0), 100)
       };
       count++;
