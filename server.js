@@ -3,17 +3,42 @@ const cors         = require('cors');
 const helmet       = require('helmet');
 const rateLimit    = require('express-rate-limit');
 const fetch        = require('node-fetch');
+const fs           = require('fs');
+const path         = require('path');
 
 const app = express();
 
 // ══════════════════════════════════════════
 // ENV VARS
 // ══════════════════════════════════════════
-const FINNHUB_KEY       = process.env.FINNHUB_KEY;
-const ONESIGNAL_APP_ID  = process.env.ONESIGNAL_APP_ID;
-const ONESIGNAL_API_KEY = process.env.ONESIGNAL_API_KEY;
-const WEBHOOK_SECRET    = process.env.WEBHOOK_SECRET;
-const ALLOWED_ORIGIN    = process.env.ALLOWED_ORIGIN || 'https://signaledge.guru';
+const FINNHUB_KEY        = process.env.FINNHUB_KEY;
+const ONESIGNAL_APP_ID   = process.env.ONESIGNAL_APP_ID;
+const ONESIGNAL_API_KEY  = process.env.ONESIGNAL_API_KEY;
+const WEBHOOK_SECRET     = process.env.WEBHOOK_SECRET;
+const ALLOWED_ORIGIN     = process.env.ALLOWED_ORIGIN || 'https://signaledge.guru';
+// Twilio SMS
+const TWILIO_SID         = process.env.TWILIO_SID;
+const TWILIO_AUTH        = process.env.TWILIO_AUTH;
+const TWILIO_FROM        = process.env.TWILIO_FROM; // e.g. +15551234567
+// Data dir (Render persistent disk)
+const DATA_DIR           = process.env.DATA_DIR || '/data';
+const SUBSCRIBERS_FILE   = path.join(DATA_DIR, 'subscribers.json');
+const HISTORY_FILE       = path.join(DATA_DIR, 'signal-history.json');
+
+// Ensure data dir exists (fallback to /tmp if /data doesn't exist)
+let DATA_READY = false;
+try {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  DATA_READY = true;
+} catch(e) {
+  console.warn(`[DATA] Cannot use ${DATA_DIR}, falling back to /tmp`);
+}
+if (!DATA_READY) {
+  try {
+    fs.mkdirSync('/tmp/signaledge-data', { recursive: true });
+    DATA_READY = true;
+  } catch(e) { console.error('[DATA] No writable dir available'); }
+}
 
 // ══════════════════════════════════════════
 // SECURITY
@@ -54,14 +79,17 @@ const aiSignals   = []; // AI (RSI/MACD/Vol/Breakout) signals
 const priceCache  = {};
 let   marketScan  = { coins: {}, updatedAt: 0 }; // Real tags for top 200
 
-// Waitlist (in-memory; copy to DB when ready)
+// Waitlist (persisted to disk)
 const waitlist = []; // { email, phone, ts, ip }
 const waitlistEmails = new Set(); // dedupe
+
+// Signal history (persisted, auto-tracked)
+const signalHistory = []; // { id, type, symbol, entry, sl, tp1, tp2, status, opened_at, closed_at, engine }
 
 // Stats tracking
 const stats = {
   startTs: Date.now(),
-  scanCount: 0,       // incremented on every /webhook-scan
+  scanCount: 0,
   totalSignalsFired: 0,
   signalsToday: 0,
   todayStartTs: Date.now()
@@ -74,23 +102,157 @@ setInterval(() => {
 }, 24 * 60 * 60 * 1000);
 
 // ══════════════════════════════════════════
+// PERSISTENCE HELPERS
+// ══════════════════════════════════════════
+function saveSubscribers() {
+  if (!DATA_READY) return;
+  try {
+    fs.writeFileSync(SUBSCRIBERS_FILE, JSON.stringify(waitlist, null, 2));
+  } catch(e) { console.error('[PERSIST] Subscribers save failed:', e.message); }
+}
+
+function loadSubscribers() {
+  if (!DATA_READY) return;
+  try {
+    if (fs.existsSync(SUBSCRIBERS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(SUBSCRIBERS_FILE, 'utf-8'));
+      if (Array.isArray(data)) {
+        data.forEach(s => {
+          if (s.email && !waitlistEmails.has(s.email)) {
+            waitlist.push(s);
+            waitlistEmails.add(s.email);
+          }
+        });
+        console.log(`[PERSIST] Loaded ${waitlist.length} subscribers from disk`);
+      }
+    }
+  } catch(e) { console.error('[PERSIST] Subscribers load failed:', e.message); }
+}
+
+function saveHistory() {
+  if (!DATA_READY) return;
+  try {
+    fs.writeFileSync(HISTORY_FILE, JSON.stringify(signalHistory.slice(0, 200), null, 2));
+  } catch(e) { console.error('[PERSIST] History save failed:', e.message); }
+}
+
+function loadHistory() {
+  if (!DATA_READY) return;
+  try {
+    if (fs.existsSync(HISTORY_FILE)) {
+      const data = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf-8'));
+      if (Array.isArray(data)) {
+        data.forEach(s => signalHistory.push(s));
+        console.log(`[PERSIST] Loaded ${signalHistory.length} historical signals from disk`);
+      }
+    }
+  } catch(e) { console.error('[PERSIST] History load failed:', e.message); }
+}
+
+loadSubscribers();
+loadHistory();
+
+// ══════════════════════════════════════════
+// TWILIO SMS
+// ══════════════════════════════════════════
+async function sendSMSBlast(message) {
+  if (!TWILIO_SID || !TWILIO_AUTH || !TWILIO_FROM) return;
+  const phoneSubs = waitlist.filter(w => w.phone && w.phone.length >= 7);
+  if (!phoneSubs.length) return;
+
+  const auth = Buffer.from(`${TWILIO_SID}:${TWILIO_AUTH}`).toString('base64');
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Messages.json`;
+
+  let sent = 0, failed = 0;
+  for (const sub of phoneSubs) {
+    try {
+      const body = new URLSearchParams({
+        To: sub.phone, From: TWILIO_FROM, Body: message
+      });
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: body.toString()
+      });
+      if (r.ok) sent++; else failed++;
+    } catch(e) { failed++; }
+  }
+  console.log(`[SMS] Blast: ${sent} sent, ${failed} failed`);
+}
+
+// ══════════════════════════════════════════
+// SIGNAL HISTORY TRACKING
+// Called periodically to update status based on current price
+// ══════════════════════════════════════════
+async function updateSignalHistory() {
+  const tracking = signalHistory.filter(s => s.status === 'tracking');
+  if (!tracking.length) return;
+
+  // Pull current prices from CoinGecko markets cache
+  const cached = priceCache['_markets'];
+  if (!cached || !cached.data || !Array.isArray(cached.data.coins)) return;
+
+  const priceMap = {};
+  cached.data.coins.forEach(c => { if (c.symbol && c.price) priceMap[c.symbol.toUpperCase()] = c.price; });
+
+  for (const sig of tracking) {
+    const current = priceMap[(sig.symbol || '').toUpperCase()];
+    if (!current) continue;
+
+    const isBuy = sig.type === 'buy';
+    const openedAgo = Date.now() - new Date(sig.opened_at).getTime();
+    const maxAge = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+    if (isBuy) {
+      if (sig.tp1 && current >= sig.tp1) { sig.status = 'hit_tp1'; sig.closed_at = new Date().toISOString(); sig.close_price = current; }
+      else if (sig.sl && current <= sig.sl)   { sig.status = 'hit_sl'; sig.closed_at = new Date().toISOString(); sig.close_price = current; }
+    } else {
+      if (sig.tp1 && current <= sig.tp1) { sig.status = 'hit_tp1'; sig.closed_at = new Date().toISOString(); sig.close_price = current; }
+      else if (sig.sl && current >= sig.sl)   { sig.status = 'hit_sl'; sig.closed_at = new Date().toISOString(); sig.close_price = current; }
+    }
+
+    if (sig.status === 'tracking' && openedAgo > maxAge) {
+      sig.status = 'expired';
+      sig.closed_at = new Date().toISOString();
+      sig.close_price = current;
+    }
+  }
+  saveHistory();
+}
+// Run every 2 minutes
+setInterval(updateSignalHistory, 2 * 60 * 1000);
+
+// ══════════════════════════════════════════
 // HEALTH CHECK
 // ══════════════════════════════════════════
 app.get('/', (req, res) => {
+  const closed = signalHistory.filter(s => s.status === 'hit_tp1' || s.status === 'hit_sl');
+  const wins = closed.filter(s => s.status === 'hit_tp1').length;
+  const winRate = closed.length > 0 ? Math.round((wins / closed.length) * 100) : null;
+
   res.json({
     status:        'SignalEdge API running',
-    version:       '6.0.0',
-    features:      ['multi-timeframe', 'scalp', 'day', 'swing', 'position', 'ai-signals', 'market-scan', 'waitlist', 'signal-history'],
+    version:       '7.0.0',
+    features:      ['multi-timeframe', 'smart-money', 'ai-signals', 'market-scan', 'alerts', 'sms', 'history'],
     signals:       signals.length,
     ai_signals:    aiSignals.length,
     market_coins:  Object.keys(marketScan.coins).length,
     market_age_s:  marketScan.updatedAt ? Math.round((Date.now() - marketScan.updatedAt) / 1000) : null,
     stats: {
-      signals_today:  stats.signalsToday,
-      total_signals:  stats.totalSignalsFired,
+      signals_today:   stats.signalsToday,
+      total_signals:   stats.totalSignalsFired,
       scans_completed: stats.scanCount,
-      uptime_hours:   Math.round((Date.now() - stats.startTs) / 3600000),
-      subscribers:    waitlist.length
+      uptime_hours:    Math.round((Date.now() - stats.startTs) / 3600000),
+      subscribers:     waitlist.length,
+      history_count:   signalHistory.length,
+      wins, losses: closed.length - wins,
+      win_rate:        winRate
+    },
+    integrations: {
+      finnhub:   !!FINNHUB_KEY,
+      onesignal: !!ONESIGNAL_API_KEY,
+      twilio:    !!(TWILIO_SID && TWILIO_AUTH && TWILIO_FROM),
+      persistence: DATA_READY
     }
   });
 });
@@ -188,7 +350,32 @@ app.get('/api/markets', priceLimiter, async (req, res) => {
 });
 
 // ══════════════════════════════════════════
-// GET SIGNALS (Institutional)
+// GET SIGNAL HISTORY
+// ══════════════════════════════════════════
+app.get('/api/signal-history', (req, res) => {
+  res.json({ history: signalHistory.slice(0, 50), total: signalHistory.length });
+});
+
+// ══════════════════════════════════════════
+// GET PERFORMANCE STATS (win rate)
+// ══════════════════════════════════════════
+app.get('/api/performance', (req, res) => {
+  const closed = signalHistory.filter(s => s.status === 'hit_tp1' || s.status === 'hit_sl' || s.status === 'expired');
+  const wins = closed.filter(s => s.status === 'hit_tp1').length;
+  const losses = closed.filter(s => s.status === 'hit_sl').length;
+  const expired = closed.filter(s => s.status === 'expired').length;
+  const tracking = signalHistory.filter(s => s.status === 'tracking').length;
+  const total = closed.length;
+  const winRate = total > 0 ? Math.round((wins / total) * 100) : null;
+  res.json({
+    total_history: signalHistory.length,
+    tracking, wins, losses, expired,
+    win_rate: winRate
+  });
+});
+
+// ══════════════════════════════════════════
+// GET SIGNALS (Smart Money / Institutional)
 // ══════════════════════════════════════════
 app.get('/api/signals', (req, res) => {
   res.json(signals.slice(0, 50));
@@ -219,7 +406,7 @@ app.post('/api/waitlist', (req, res) => {
     if (waitlistEmails.has(email)) {
       if (phone) {
         const existing = waitlist.find(w => w.email === email);
-        if (existing && !existing.phone) existing.phone = phone;
+        if (existing && !existing.phone) { existing.phone = phone; saveSubscribers(); }
       }
       return res.json({ success: true, already_registered: true });
     }
@@ -232,6 +419,7 @@ app.post('/api/waitlist', (req, res) => {
     };
     waitlist.push(entry);
     waitlistEmails.add(email);
+    saveSubscribers();
 
     console.log(`[ALERTS] +${email}${phone ? ' (+phone)' : ''} → total subscribers: ${waitlist.length}`);
     res.json({ success: true });
@@ -339,6 +527,32 @@ app.post('/webhook', webhookLimiter, async (req, res) => {
     stats.totalSignalsFired++;
     stats.signalsToday++;
 
+    // Record in history for auto-tracking
+    signalHistory.unshift({
+      id: signal.id,
+      engine: 'smart_money',
+      type: signal.type,
+      symbol: signal.symbol,
+      entry: signal.price,
+      sl: signal.sl,
+      tp1: signal.tp1,
+      tp2: signal.tp2,
+      tp3: signal.tp3,
+      timeframe: signal.timeframe,
+      style: signal.style,
+      style_label: signal.style_label,
+      status: 'tracking',
+      opened_at: signal.time,
+      closed_at: null,
+      close_price: null
+    });
+    if (signalHistory.length > 200) signalHistory.pop();
+    saveHistory();
+
+    // SMS blast
+    const smsMsg = `SignalEdge ${signal.type.toUpperCase()} ${symbol} @ ${price} | SL ${signal.sl} | TP1 ${signal.tp1}${signal.rr ? ' | RR ' + signal.rr : ''}`;
+    sendSMSBlast(smsMsg).catch(()=>{});
+
     // Push notification
     if (ONESIGNAL_API_KEY && ONESIGNAL_APP_ID) {
       const dirEmoji = isBuy ? '🟢' : '🔴';
@@ -412,6 +626,32 @@ app.post('/webhook-ai', webhookLimiter, async (req, res) => {
     stats.totalSignalsFired++;
     stats.signalsToday++;
 
+    // Record in history (AI signals with levels only)
+    if (aiSignal.sl && aiSignal.tp1) {
+      signalHistory.unshift({
+        id: aiSignal.id,
+        engine: 'ai',
+        type: aiSignal.type,
+        symbol: aiSignal.symbol,
+        entry: aiSignal.entry || aiSignal.price,
+        sl: aiSignal.sl,
+        tp1: aiSignal.tp1,
+        tp2: aiSignal.tp2,
+        timeframe: aiSignal.timeframe,
+        confidence: aiSignal.confidence,
+        status: 'tracking',
+        opened_at: aiSignal.time,
+        closed_at: null,
+        close_price: null
+      });
+      if (signalHistory.length > 200) signalHistory.pop();
+      saveHistory();
+    }
+
+    // SMS blast
+    const smsMsg = `SignalEdge AI ${aiSignal.type.toUpperCase()} ${symbol} @ ${price} | ${aiSignal.confidence}%${aiSignal.sl ? ' | SL ' + aiSignal.sl : ''}${aiSignal.tp1 ? ' | TP1 ' + aiSignal.tp1 : ''}`;
+    sendSMSBlast(smsMsg).catch(()=>{});
+
     console.log(`[AI] ${type.toUpperCase()} ${symbol} @ ${price} | ${aiSignal.confidence}% | ${tags.join(',')}`);
     res.json({ success: true, signal: aiSignal });
   } catch(err) {
@@ -434,9 +674,13 @@ app.use((err, req, res, next) => {
 // ══════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`SignalEdge API v6.0 running on port ${PORT}`);
+  console.log(`SignalEdge API v7.0 running on port ${PORT}`);
   console.log(`CORS allowed origin: ${ALLOWED_ORIGIN}`);
   console.log(`Finnhub:      ${FINNHUB_KEY ? '✓' : '✗'}`);
   console.log(`OneSignal:    ${ONESIGNAL_API_KEY ? '✓' : '✗'}`);
+  console.log(`Twilio SMS:   ${TWILIO_SID && TWILIO_AUTH && TWILIO_FROM ? '✓' : '✗'}`);
   console.log(`Webhook sec:  ${WEBHOOK_SECRET ? '✓' : '✗'}`);
+  console.log(`Data dir:     ${DATA_READY ? '✓ ' + (fs.existsSync(DATA_DIR) ? DATA_DIR : '/tmp/signaledge-data') : '✗'}`);
+  console.log(`Subscribers:  ${waitlist.length}`);
+  console.log(`History:      ${signalHistory.length} signals`);
 });
