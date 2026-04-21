@@ -81,7 +81,8 @@ const priceCache  = {}; // Cache prices to avoid hitting API limits
 app.get('/', (req, res) => {
   res.json({
     status:  'SignalEdge API running',
-    version: '2.0.0',
+    version: '3.0.0',
+    features: ['multi-timeframe', 'scalp', 'day', 'swing', 'position'],
     signals: signals.length
   });
 });
@@ -208,19 +209,26 @@ app.post('/webhook', webhookLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Invalid signal type' });
     }
 
-    // Sanitize inputs
+    // Sanitize inputs — v3 includes multi-timeframe fields
     const signal = {
-      id:        Date.now(),
-      type:      isBuy ? 'buy' : 'sell',
-      symbol:    symbol.substring(0, 20), // max 20 chars
-      price:     price,
-      sl:        parseFloat(body.sl)  || 0,
-      tp1:       parseFloat(body.tp1) || 0,
-      tp2:       parseFloat(body.tp2) || 0,
-      tp3:       parseFloat(body.tp3) || 0,
-      timeframe: (body.timeframe || '4H').substring(0, 10),
-      time:      new Date().toISOString(),
-      source:    'Order Block & Fib Target Pro'
+      id:          Date.now(),
+      type:        isBuy ? 'buy' : 'sell',
+      symbol:      symbol.substring(0, 20),
+      price:       price,
+      sl:          parseFloat(body.sl)  || 0,
+      tp1:         parseFloat(body.tp1) || 0,
+      tp2:         parseFloat(body.tp2) || 0,
+      tp3:         parseFloat(body.tp3) || 0,
+      timeframe:   (body.timeframe || '4H').substring(0, 10),
+      // ── Multi-timeframe fields (v3) ──
+      style:       (body.style || 'swing').toString().toLowerCase().substring(0, 15),
+      style_label: (body.style_label || 'Swing Trade').toString().substring(0, 30),
+      hold:        (body.hold || '1–7 days').toString().substring(0, 30),
+      rr:          parseFloat(body.rr)       || 0,
+      risk_pct:    parseFloat(body.risk_pct) || 0,
+      strategy:    (body.strategy || 'SignalEdge Institutional').toString().substring(0, 50),
+      time:        new Date().toISOString(),
+      source:      'SignalEdge Multi-Timeframe Bot'
     };
 
     // Store signal
@@ -229,10 +237,17 @@ app.post('/webhook', webhookLimiter, async (req, res) => {
 
     // Push notification via OneSignal
     if (ONESIGNAL_API_KEY && ONESIGNAL_APP_ID) {
-      const emoji   = isBuy ? '🟢' : '🔴';
-      const dir     = isBuy ? 'BUY' : 'SELL';
-      const title   = `${emoji} ${dir} — ${symbol}`;
-      const message = `Entry: ${price} | SL: ${signal.sl || '—'} | TP1: ${signal.tp1 || '—'}`;
+      const dirEmoji = isBuy ? '🟢' : '🔴';
+      const dir      = isBuy ? 'BUY' : 'SELL';
+      const styleEmojis = {
+        scalp:    '⚡',
+        day:      '📊',
+        swing:    '🎯',
+        position: '🏦'
+      };
+      const stEmoji = styleEmojis[signal.style] || '🎯';
+      const title   = `${dirEmoji} ${stEmoji} ${signal.style_label} ${dir} — ${symbol}`;
+      const message = `Entry: ${price} | SL: ${signal.sl || '—'} | TP1: ${signal.tp1 || '—'}${signal.rr ? ' | RR: ' + signal.rr : ''}`;
 
       fetch('https://onesignal.com/api/v1/notifications', {
         method:  'POST',
@@ -251,7 +266,7 @@ app.post('/webhook', webhookLimiter, async (req, res) => {
       }).catch(e => console.error('OneSignal error:', e.message));
     }
 
-    console.log(`[SIGNAL] ${signal.type.toUpperCase()} ${symbol} @ ${price}`);
+    console.log(`[SIGNAL v3] ${signal.style_label} ${signal.type.toUpperCase()} ${symbol} @ ${price} | RR ${signal.rr}`);
     res.json({ success: true, signal });
 
   } catch(err) {
@@ -280,9 +295,10 @@ app.use((err, req, res, next) => {
 // ══════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`SignalEdge Secure API v2.0 running on port ${PORT}`);
+  console.log(`SignalEdge Secure API v3.0 (Multi-Timeframe) running on port ${PORT}`);
   console.log(`CORS allowed origin: ${ALLOWED_ORIGIN}`);
   console.log(`Finnhub key: ${FINNHUB_KEY ? '✓ loaded' : '✗ missing'}`);
   console.log(`OneSignal:   ${ONESIGNAL_API_KEY ? '✓ loaded' : '✗ missing'}`);
   console.log(`Webhook secret: ${WEBHOOK_SECRET ? '✓ loaded' : '✗ missing'}`);
+  console.log(`Styles supported: scalp, day, swing, position`);
 });
