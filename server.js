@@ -24,6 +24,8 @@ const TWILIO_FROM        = process.env.TWILIO_FROM; // e.g. +15551234567
 const DATA_DIR           = process.env.DATA_DIR || '/data';
 const SUBSCRIBERS_FILE   = path.join(DATA_DIR, 'subscribers.json');
 const HISTORY_FILE       = path.join(DATA_DIR, 'signal-history.json');
+const SIGNALS_FILE       = path.join(DATA_DIR, 'active-signals.json');
+const AI_SIGNALS_FILE    = path.join(DATA_DIR, 'active-ai-signals.json');
 
 // Ensure data dir exists (fallback to /tmp if /data doesn't exist)
 let DATA_READY = false;
@@ -160,8 +162,64 @@ function loadHistory() {
   } catch(e) { console.error('[PERSIST] History load failed:', e.message); }
 }
 
+// ── Active signal persistence (Pro/Premium live feed) ──
+// Saves on every push so restarts don't wipe the homepage.
+function saveSignals() {
+  if (!DATA_READY) return;
+  try {
+    fs.writeFileSync(SIGNALS_FILE, JSON.stringify(signals.slice(0, 50), null, 2));
+  } catch(e) { console.error('[PERSIST] Signals save failed:', e.message); }
+}
+
+function loadSignals() {
+  if (!DATA_READY) return;
+  try {
+    if (fs.existsSync(SIGNALS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(SIGNALS_FILE, 'utf-8'));
+      if (Array.isArray(data)) {
+        // Only load signals from the last 24 hours — anything older is stale
+        const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+        const fresh = data.filter(s => {
+          const ts = new Date(s.time || s.opened_at || 0).getTime();
+          return ts > cutoff;
+        });
+        fresh.forEach(s => signals.push(s));
+        console.log(`[PERSIST] Loaded ${signals.length} active signals from disk (${data.length - fresh.length} stale dropped)`);
+      }
+    }
+  } catch(e) { console.error('[PERSIST] Signals load failed:', e.message); }
+}
+
+// ── Active AI signal persistence ──
+function saveAiSignals() {
+  if (!DATA_READY) return;
+  try {
+    fs.writeFileSync(AI_SIGNALS_FILE, JSON.stringify(aiSignals.slice(0, 100), null, 2));
+  } catch(e) { console.error('[PERSIST] AI signals save failed:', e.message); }
+}
+
+function loadAiSignals() {
+  if (!DATA_READY) return;
+  try {
+    if (fs.existsSync(AI_SIGNALS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(AI_SIGNALS_FILE, 'utf-8'));
+      if (Array.isArray(data)) {
+        const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+        const fresh = data.filter(s => {
+          const ts = new Date(s.time || s.opened_at || 0).getTime();
+          return ts > cutoff;
+        });
+        fresh.forEach(s => aiSignals.push(s));
+        console.log(`[PERSIST] Loaded ${aiSignals.length} active AI signals from disk (${data.length - fresh.length} stale dropped)`);
+      }
+    }
+  } catch(e) { console.error('[PERSIST] AI signals load failed:', e.message); }
+}
+
 loadSubscribers();
 loadHistory();
+loadSignals();
+loadAiSignals();
 
 function saveFundamentals() {
   if (!DATA_READY) return;
@@ -406,21 +464,8 @@ app.get('/api/signal-history', (req, res) => {
 // ══════════════════════════════════════════
 app.get('/api/performance', (req, res) => {
   const hist = signalHistory;
-  const winsArr   = hist.filter(s => s.status === 'hit_tp1');
-  const lossesArr = hist.filter(s => s.status === 'hit_sl');
-  const expiredArr= hist.filter(s => s.status === 'expired');
-  const trackingArr = hist.filter(s => s.status === 'tracking');
-
-  const wins    = winsArr.length;
-  const losses  = lossesArr.length;
-  const expired = expiredArr.length;
-  const tracking= trackingArr.length;
-  const closed  = wins + losses + expired;
-  const winRate = closed > 0 ? Math.round((wins / closed) * 100) : null;
 
   // Helper: % move from entry → close_price, signed by direction
-  // For buy: (close - entry) / entry * 100
-  // For sell: (entry - close) / entry * 100  (profit when price drops)
   function pctMove(s) {
     if (!s.entry || !s.close_price) return null;
     const raw = ((s.close_price - s.entry) / s.entry) * 100;
@@ -436,84 +481,134 @@ app.get('/api/performance', (req, res) => {
     return reward / risk;
   }
 
-  // Avg gain on winners (should be positive)
-  const winPcts = winsArr.map(pctMove).filter(v => v !== null && isFinite(v));
-  const avgGainPct = winPcts.length
-    ? +(winPcts.reduce((a,b) => a + b, 0) / winPcts.length).toFixed(2)
-    : null;
-
-  // Avg loss on losers (should be negative)
-  const lossPcts = lossesArr.map(pctMove).filter(v => v !== null && isFinite(v));
-  const avgLossPct = lossPcts.length
-    ? +(lossPcts.reduce((a,b) => a + b, 0) / lossPcts.length).toFixed(2)
-    : null;
-
-  // Avg planned R:R across ALL history (not just closed)
-  const rrs = hist.map(plannedRR).filter(v => v !== null && isFinite(v) && v > 0);
-  const avgRR = rrs.length
-    ? +(rrs.reduce((a,b) => a + b, 0) / rrs.length).toFixed(2)
-    : null;
-
-  // Expectancy = (winRate × avgGain) + (lossRate × avgLoss)
-  // lossRate here = (losses + expired) / closed  — expired signals hurt expectancy too
-  let expectancyPct = null;
-  if (closed > 0 && avgGainPct !== null && avgLossPct !== null) {
-    const wR = wins / closed;
-    const lR = (losses + expired) / closed;
-    expectancyPct = +((wR * avgGainPct) + (lR * avgLossPct)).toFixed(2);
+  // Engine classifier: history records have `engine` = 'smart_money' | 'ai'
+  // smart_money covers both Pro (swing/day/position) and Premium (sweep/scalp).
+  // Distinguish by style: style === 'sweep' → premium, anything else → pro.
+  function engineOf(s) {
+    if (s.engine === 'ai') return 'ai';
+    if (s.engine === 'smart_money') {
+      return s.style === 'sweep' ? 'premium' : 'pro';
+    }
+    return 'other';
   }
 
-  // Best win: biggest % gain among winners
-  let bestWin = null;
-  if (winPcts.length) {
-    let bestIdx = 0, bestPct = -Infinity;
-    winsArr.forEach((s, i) => {
-      const p = pctMove(s);
-      if (p !== null && p > bestPct) { bestPct = p; bestIdx = i; }
+  // Compute stats for a given subset of history records.
+  // Returns the same shape for all / pro / premium / ai.
+  function computeStats(subset) {
+    const winsArr     = subset.filter(s => s.status === 'hit_tp1');
+    const lossesArr   = subset.filter(s => s.status === 'hit_sl');
+    const expiredArr  = subset.filter(s => s.status === 'expired');
+    const trackingArr = subset.filter(s => s.status === 'tracking');
+
+    const wins    = winsArr.length;
+    const losses  = lossesArr.length;
+    const expired = expiredArr.length;
+    const tracking= trackingArr.length;
+    const closed  = wins + losses + expired;
+    const winRate = closed > 0 ? Math.round((wins / closed) * 100) : null;
+
+    const winPcts = winsArr.map(pctMove).filter(v => v !== null && isFinite(v));
+    const avgGainPct = winPcts.length
+      ? +(winPcts.reduce((a,b) => a + b, 0) / winPcts.length).toFixed(2)
+      : null;
+
+    const lossPcts = lossesArr.map(pctMove).filter(v => v !== null && isFinite(v));
+    const avgLossPct = lossPcts.length
+      ? +(lossPcts.reduce((a,b) => a + b, 0) / lossPcts.length).toFixed(2)
+      : null;
+
+    const rrs = subset.map(plannedRR).filter(v => v !== null && isFinite(v) && v > 0);
+    const avgRR = rrs.length
+      ? +(rrs.reduce((a,b) => a + b, 0) / rrs.length).toFixed(2)
+      : null;
+
+    let expectancyPct = null;
+    if (closed > 0 && avgGainPct !== null && avgLossPct !== null) {
+      const wR = wins / closed;
+      const lR = (losses + expired) / closed;
+      expectancyPct = +((wR * avgGainPct) + (lR * avgLossPct)).toFixed(2);
+    }
+
+    let bestWin = null;
+    if (winPcts.length) {
+      let bestIdx = 0, bestPct = -Infinity;
+      winsArr.forEach((s, i) => {
+        const p = pctMove(s);
+        if (p !== null && p > bestPct) { bestPct = p; bestIdx = i; }
+      });
+      const b = winsArr[bestIdx];
+      bestWin = {
+        symbol: b.symbol,
+        pct: +bestPct.toFixed(2),
+        closed_at: b.closed_at
+      };
+    }
+
+    const now = Date.now();
+    const LIVE_WINDOW_MS = 15 * 60 * 1000;
+    let live = 0, running = 0;
+    trackingArr.forEach(s => {
+      const ageMs = now - new Date(s.opened_at).getTime();
+      if (ageMs < LIVE_WINDOW_MS) live++; else running++;
     });
-    const b = winsArr[bestIdx];
-    bestWin = {
-      symbol: b.symbol,
-      pct: +bestPct.toFixed(2),
-      closed_at: b.closed_at
+
+    const last30 = subset
+      .filter(s => s.status === 'hit_tp1' || s.status === 'hit_sl' || s.status === 'expired')
+      .slice(0, 30)
+      .reverse()
+      .map(s => {
+        if (s.status === 'hit_tp1') return 'w';
+        if (s.status === 'hit_sl')  return 'l';
+        return 'e';
+      });
+
+    return {
+      total_history: subset.length,
+      tracking, wins, losses, expired,
+      win_rate: winRate,
+      closed,
+      avg_gain_pct: avgGainPct,
+      avg_loss_pct: avgLossPct,
+      avg_rr: avgRR,
+      expectancy_pct: expectancyPct,
+      best_win: bestWin,
+      active: { total: tracking, live, running },
+      last30
     };
   }
 
-  // Active split: "live" = opened <15 min ago, "running" = older but still tracking
-  const now = Date.now();
-  const LIVE_WINDOW_MS = 15 * 60 * 1000;
-  let live = 0, running = 0;
-  trackingArr.forEach(s => {
-    const ageMs = now - new Date(s.opened_at).getTime();
-    if (ageMs < LIVE_WINDOW_MS) live++; else running++;
-  });
+  // All-engines stats (legacy top-level fields)
+  const all = computeStats(hist);
 
-  // last30: most recent 30 CLOSED outcomes, ordered oldest→newest for dot strip
-  // signalHistory is stored newest-first (unshift). Filter closed, take first 30, reverse.
-  const last30 = hist
-    .filter(s => s.status === 'hit_tp1' || s.status === 'hit_sl' || s.status === 'expired')
-    .slice(0, 30)
-    .reverse()
-    .map(s => {
-      if (s.status === 'hit_tp1') return 'w';
-      if (s.status === 'hit_sl')  return 'l';
-      return 'e'; // expired
-    });
+  // Per-engine breakdowns
+  const proHist     = hist.filter(s => engineOf(s) === 'pro');
+  const premiumHist = hist.filter(s => engineOf(s) === 'premium');
+  const aiHist      = hist.filter(s => engineOf(s) === 'ai');
+
+  const byEngine = {
+    pro:     computeStats(proHist),
+    premium: computeStats(premiumHist),
+    ai:      computeStats(aiHist)
+  };
 
   res.json({
-    // legacy fields (preserved for backwards-compat)
-    total_history: hist.length,
-    tracking, wins, losses, expired,
-    win_rate: winRate,
-    // new fields for v5
-    closed,
-    avg_gain_pct: avgGainPct,
-    avg_loss_pct: avgLossPct,
-    avg_rr: avgRR,
-    expectancy_pct: expectancyPct,
-    best_win: bestWin,
-    active: { total: tracking, live, running },
-    last30,
+    // legacy top-level fields preserved for backwards-compat with frontend
+    total_history: all.total_history,
+    tracking: all.tracking,
+    wins: all.wins,
+    losses: all.losses,
+    expired: all.expired,
+    win_rate: all.win_rate,
+    closed: all.closed,
+    avg_gain_pct: all.avg_gain_pct,
+    avg_loss_pct: all.avg_loss_pct,
+    avg_rr: all.avg_rr,
+    expectancy_pct: all.expectancy_pct,
+    best_win: all.best_win,
+    active: all.active,
+    last30: all.last30,
+    // NEW: per-engine breakdown
+    by_engine: byEngine,
     updated_at: new Date().toISOString()
   });
 });
@@ -737,6 +832,7 @@ app.post('/webhook', webhookLimiter, async (req, res) => {
 
     signals.unshift(signal);
     if (signals.length > 100) signals.pop();
+    saveSignals();
     stats.totalSignalsFired++;
     stats.signalsToday++;
 
@@ -848,6 +944,7 @@ app.post('/webhook-ai', webhookLimiter, async (req, res) => {
 
     aiSignals.unshift(aiSignal);
     if (aiSignals.length > 100) aiSignals.pop();
+    saveAiSignals();
     stats.totalSignalsFired++;
     stats.signalsToday++;
 
