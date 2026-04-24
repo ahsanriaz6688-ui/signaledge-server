@@ -398,20 +398,123 @@ app.get('/api/signal-history', (req, res) => {
 });
 
 // ══════════════════════════════════════════
-// GET PERFORMANCE STATS (win rate)
+// GET PERFORMANCE STATS
+// Returns expectancy-framed metrics for v5 frontend.
+// All derived from signalHistory entries with entry/sl/tp1/close_price/status.
+// NOTE: close_price is set at transition time (current price when status flipped),
+// which is slightly noisier than using exactly sl/tp1. Directionally correct.
 // ══════════════════════════════════════════
 app.get('/api/performance', (req, res) => {
-  const closed = signalHistory.filter(s => s.status === 'hit_tp1' || s.status === 'hit_sl' || s.status === 'expired');
-  const wins = closed.filter(s => s.status === 'hit_tp1').length;
-  const losses = closed.filter(s => s.status === 'hit_sl').length;
-  const expired = closed.filter(s => s.status === 'expired').length;
-  const tracking = signalHistory.filter(s => s.status === 'tracking').length;
-  const total = closed.length;
-  const winRate = total > 0 ? Math.round((wins / total) * 100) : null;
+  const hist = signalHistory;
+  const winsArr   = hist.filter(s => s.status === 'hit_tp1');
+  const lossesArr = hist.filter(s => s.status === 'hit_sl');
+  const expiredArr= hist.filter(s => s.status === 'expired');
+  const trackingArr = hist.filter(s => s.status === 'tracking');
+
+  const wins    = winsArr.length;
+  const losses  = lossesArr.length;
+  const expired = expiredArr.length;
+  const tracking= trackingArr.length;
+  const closed  = wins + losses + expired;
+  const winRate = closed > 0 ? Math.round((wins / closed) * 100) : null;
+
+  // Helper: % move from entry → close_price, signed by direction
+  // For buy: (close - entry) / entry * 100
+  // For sell: (entry - close) / entry * 100  (profit when price drops)
+  function pctMove(s) {
+    if (!s.entry || !s.close_price) return null;
+    const raw = ((s.close_price - s.entry) / s.entry) * 100;
+    return s.type === 'sell' ? -raw : raw;
+  }
+
+  // Helper: planned R:R from entry/sl/tp1
+  function plannedRR(s) {
+    if (!s.entry || !s.sl || !s.tp1) return null;
+    const risk   = Math.abs(s.entry - s.sl);
+    const reward = Math.abs(s.tp1 - s.entry);
+    if (risk <= 0) return null;
+    return reward / risk;
+  }
+
+  // Avg gain on winners (should be positive)
+  const winPcts = winsArr.map(pctMove).filter(v => v !== null && isFinite(v));
+  const avgGainPct = winPcts.length
+    ? +(winPcts.reduce((a,b) => a + b, 0) / winPcts.length).toFixed(2)
+    : null;
+
+  // Avg loss on losers (should be negative)
+  const lossPcts = lossesArr.map(pctMove).filter(v => v !== null && isFinite(v));
+  const avgLossPct = lossPcts.length
+    ? +(lossPcts.reduce((a,b) => a + b, 0) / lossPcts.length).toFixed(2)
+    : null;
+
+  // Avg planned R:R across ALL history (not just closed)
+  const rrs = hist.map(plannedRR).filter(v => v !== null && isFinite(v) && v > 0);
+  const avgRR = rrs.length
+    ? +(rrs.reduce((a,b) => a + b, 0) / rrs.length).toFixed(2)
+    : null;
+
+  // Expectancy = (winRate × avgGain) + (lossRate × avgLoss)
+  // lossRate here = (losses + expired) / closed  — expired signals hurt expectancy too
+  let expectancyPct = null;
+  if (closed > 0 && avgGainPct !== null && avgLossPct !== null) {
+    const wR = wins / closed;
+    const lR = (losses + expired) / closed;
+    expectancyPct = +((wR * avgGainPct) + (lR * avgLossPct)).toFixed(2);
+  }
+
+  // Best win: biggest % gain among winners
+  let bestWin = null;
+  if (winPcts.length) {
+    let bestIdx = 0, bestPct = -Infinity;
+    winsArr.forEach((s, i) => {
+      const p = pctMove(s);
+      if (p !== null && p > bestPct) { bestPct = p; bestIdx = i; }
+    });
+    const b = winsArr[bestIdx];
+    bestWin = {
+      symbol: b.symbol,
+      pct: +bestPct.toFixed(2),
+      closed_at: b.closed_at
+    };
+  }
+
+  // Active split: "live" = opened <15 min ago, "running" = older but still tracking
+  const now = Date.now();
+  const LIVE_WINDOW_MS = 15 * 60 * 1000;
+  let live = 0, running = 0;
+  trackingArr.forEach(s => {
+    const ageMs = now - new Date(s.opened_at).getTime();
+    if (ageMs < LIVE_WINDOW_MS) live++; else running++;
+  });
+
+  // last30: most recent 30 CLOSED outcomes, ordered oldest→newest for dot strip
+  // signalHistory is stored newest-first (unshift). Filter closed, take first 30, reverse.
+  const last30 = hist
+    .filter(s => s.status === 'hit_tp1' || s.status === 'hit_sl' || s.status === 'expired')
+    .slice(0, 30)
+    .reverse()
+    .map(s => {
+      if (s.status === 'hit_tp1') return 'w';
+      if (s.status === 'hit_sl')  return 'l';
+      return 'e'; // expired
+    });
+
   res.json({
-    total_history: signalHistory.length,
+    // legacy fields (preserved for backwards-compat)
+    total_history: hist.length,
     tracking, wins, losses, expired,
-    win_rate: winRate
+    win_rate: winRate,
+    // new fields for v5
+    closed,
+    avg_gain_pct: avgGainPct,
+    avg_loss_pct: avgLossPct,
+    avg_rr: avgRR,
+    expectancy_pct: expectancyPct,
+    best_win: bestWin,
+    active: { total: tracking, live, running },
+    last30,
+    updated_at: new Date().toISOString()
   });
 });
 
@@ -567,6 +670,7 @@ app.post('/webhook-fundamentals', webhookLimiter, (req, res) => {
         score:     Math.min(Math.max(parseFloat(c.score) || 0, 0), 100),
         breakdown: (typeof c.breakdown === 'object' && c.breakdown !== null) ? c.breakdown : {},
         has_tvl:   !!c.has_tvl,
+        tier:      parseInt(c.tier) || 1,
         updated_at: c.updated_at || new Date().toISOString()
       };
       updated++;
