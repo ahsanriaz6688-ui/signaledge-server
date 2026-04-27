@@ -24,8 +24,6 @@ const TWILIO_FROM        = process.env.TWILIO_FROM; // e.g. +15551234567
 const DATA_DIR           = process.env.DATA_DIR || '/data';
 const SUBSCRIBERS_FILE   = path.join(DATA_DIR, 'subscribers.json');
 const HISTORY_FILE       = path.join(DATA_DIR, 'signal-history.json');
-const SIGNALS_FILE       = path.join(DATA_DIR, 'active-signals.json');
-const AI_SIGNALS_FILE    = path.join(DATA_DIR, 'active-ai-signals.json');
 
 // Ensure data dir exists (fallback to /tmp if /data doesn't exist)
 let DATA_READY = false;
@@ -162,8 +160,12 @@ function loadHistory() {
   } catch(e) { console.error('[PERSIST] History load failed:', e.message); }
 }
 
+loadSubscribers();
+loadHistory();
+
 // ── Active signal persistence (Pro/Premium live feed) ──
-// Saves on every push so restarts don't wipe the homepage.
+// PATCH v7.1: previously signals[] was in-memory only, so restarts wiped
+// the homepage. Now persisted to disk like history and subscribers.
 function saveSignals() {
   if (!DATA_READY) return;
   try {
@@ -177,8 +179,8 @@ function loadSignals() {
     if (fs.existsSync(SIGNALS_FILE)) {
       const data = JSON.parse(fs.readFileSync(SIGNALS_FILE, 'utf-8'));
       if (Array.isArray(data)) {
-        // Only load signals from the last 24 hours — anything older is stale
-        const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+        // Drop anything older than 7 days on load
+        const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
         const fresh = data.filter(s => {
           const ts = new Date(s.time || s.opened_at || 0).getTime();
           return ts > cutoff;
@@ -190,7 +192,6 @@ function loadSignals() {
   } catch(e) { console.error('[PERSIST] Signals load failed:', e.message); }
 }
 
-// ── Active AI signal persistence ──
 function saveAiSignals() {
   if (!DATA_READY) return;
   try {
@@ -204,7 +205,7 @@ function loadAiSignals() {
     if (fs.existsSync(AI_SIGNALS_FILE)) {
       const data = JSON.parse(fs.readFileSync(AI_SIGNALS_FILE, 'utf-8'));
       if (Array.isArray(data)) {
-        const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+        const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
         const fresh = data.filter(s => {
           const ts = new Date(s.time || s.opened_at || 0).getTime();
           return ts > cutoff;
@@ -216,10 +217,74 @@ function loadAiSignals() {
   } catch(e) { console.error('[PERSIST] AI signals load failed:', e.message); }
 }
 
-loadSubscribers();
-loadHistory();
 loadSignals();
 loadAiSignals();
+
+// ──────────────────────────────────────────
+// PATCH v7.1 (A): One-time cleanup of pre-v5.1 broken signals
+// On startup, mark any AI signals fired before April 28 02:00 UTC
+// (the v5.1 deploy timestamp) as expired in history. These were
+// fired by the buggy bot that sold deeply oversold RSI.
+// Also wipes the active feeds clean — they'll repopulate from new scans.
+// ──────────────────────────────────────────
+(function cleanupBrokenSignals() {
+  const V51_DEPLOY_TIMESTAMP = new Date('2026-04-28T02:00:00Z').getTime();
+
+  // Mark broken AI history records as expired
+  let aiExpired = 0;
+  signalHistory.forEach(s => {
+    if (s.engine === 'ai' && s.status === 'tracking') {
+      const openedTs = new Date(s.opened_at).getTime();
+      if (openedTs < V51_DEPLOY_TIMESTAMP) {
+        s.status = 'expired';
+        s.closed_at = new Date().toISOString();
+        s.close_price = null;
+        s.cleanup_reason = 'pre_v51_broken_logic';
+        aiExpired++;
+      }
+    }
+  });
+
+  // Mark stale Pro/Premium history records as expired (>7 days, still tracking)
+  // This handles the AXS signal from April 25.
+  let instExpired = 0;
+  const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  signalHistory.forEach(s => {
+    if (s.engine === 'smart_money' && s.status === 'tracking') {
+      const openedTs = new Date(s.opened_at).getTime();
+      if (openedTs < sevenDaysAgo) {
+        s.status = 'expired';
+        s.closed_at = new Date().toISOString();
+        s.close_price = null;
+        s.cleanup_reason = 'stale_over_7d';
+        instExpired++;
+      }
+    }
+  });
+
+  // Prune active feeds to match
+  const beforeAi = aiSignals.length;
+  for (let i = aiSignals.length - 1; i >= 0; i--) {
+    const ts = new Date(aiSignals[i].time || aiSignals[i].opened_at || 0).getTime();
+    if (ts < V51_DEPLOY_TIMESTAMP) aiSignals.splice(i, 1);
+  }
+
+  const beforeSigs = signals.length;
+  for (let i = signals.length - 1; i >= 0; i--) {
+    const ts = new Date(signals[i].time || signals[i].opened_at || 0).getTime();
+    if (ts < sevenDaysAgo) signals.splice(i, 1);
+  }
+
+  if (aiExpired || instExpired || beforeAi !== aiSignals.length || beforeSigs !== signals.length) {
+    saveHistory();
+    saveSignals();
+    saveAiSignals();
+    console.log(`[CLEANUP] Pre-v5.1 broken AI: ${aiExpired} history + ${beforeAi - aiSignals.length} active`);
+    console.log(`[CLEANUP] Stale institutional (>7d): ${instExpired} history + ${beforeSigs - signals.length} active`);
+  } else {
+    console.log(`[CLEANUP] No stale or broken signals to clean — all good.`);
+  }
+})();
 
 function saveFundamentals() {
   if (!DATA_READY) return;
@@ -272,42 +337,85 @@ async function sendSMSBlast(message) {
 
 // ══════════════════════════════════════════
 // SIGNAL HISTORY TRACKING
-// Called periodically to update status based on current price
+// Called periodically to update status based on current price.
+// PATCH v7.1 (B): Also prunes resolved/stale signals from active feeds
+// (signals[] and aiSignals[]). Previously the active arrays grew forever,
+// causing signals like AXS to stay "RUNNING" on the website even after
+// their history record was marked WIN/LOSS/expired.
 // ══════════════════════════════════════════
 async function updateSignalHistory() {
   const tracking = signalHistory.filter(s => s.status === 'tracking');
-  if (!tracking.length) return;
 
   // Pull current prices from CoinGecko markets cache
   const cached = priceCache['_markets'];
-  if (!cached || !cached.data || !Array.isArray(cached.data.coins)) return;
-
   const priceMap = {};
-  cached.data.coins.forEach(c => { if (c.symbol && c.price) priceMap[c.symbol.toUpperCase()] = c.price; });
+  if (cached && cached.data && Array.isArray(cached.data.coins)) {
+    cached.data.coins.forEach(c => { if (c.symbol && c.price) priceMap[c.symbol.toUpperCase()] = c.price; });
+  }
 
+  const maxAge = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+  // ── 1) Update history records (existing logic) ──
   for (const sig of tracking) {
     const current = priceMap[(sig.symbol || '').toUpperCase()];
-    if (!current) continue;
-
-    const isBuy = sig.type === 'buy';
     const openedAgo = Date.now() - new Date(sig.opened_at).getTime();
-    const maxAge = 7 * 24 * 60 * 60 * 1000; // 7 days
 
-    if (isBuy) {
-      if (sig.tp1 && current >= sig.tp1) { sig.status = 'hit_tp1'; sig.closed_at = new Date().toISOString(); sig.close_price = current; }
-      else if (sig.sl && current <= sig.sl)   { sig.status = 'hit_sl'; sig.closed_at = new Date().toISOString(); sig.close_price = current; }
-    } else {
-      if (sig.tp1 && current <= sig.tp1) { sig.status = 'hit_tp1'; sig.closed_at = new Date().toISOString(); sig.close_price = current; }
-      else if (sig.sl && current >= sig.sl)   { sig.status = 'hit_sl'; sig.closed_at = new Date().toISOString(); sig.close_price = current; }
+    if (current) {
+      const isBuy = sig.type === 'buy';
+      if (isBuy) {
+        if (sig.tp1 && current >= sig.tp1) { sig.status = 'hit_tp1'; sig.closed_at = new Date().toISOString(); sig.close_price = current; }
+        else if (sig.sl && current <= sig.sl)   { sig.status = 'hit_sl'; sig.closed_at = new Date().toISOString(); sig.close_price = current; }
+      } else {
+        if (sig.tp1 && current <= sig.tp1) { sig.status = 'hit_tp1'; sig.closed_at = new Date().toISOString(); sig.close_price = current; }
+        else if (sig.sl && current >= sig.sl)   { sig.status = 'hit_sl'; sig.closed_at = new Date().toISOString(); sig.close_price = current; }
+      }
     }
 
+    // Auto-expire after 7 days regardless of price availability
     if (sig.status === 'tracking' && openedAgo > maxAge) {
       sig.status = 'expired';
       sig.closed_at = new Date().toISOString();
-      sig.close_price = current;
+      sig.close_price = current || null;
     }
   }
   saveHistory();
+
+  // ── 2) PATCH B: Prune active feeds ──
+  // Build a Set of resolved history IDs for fast lookup
+  const resolvedIds = new Set(
+    signalHistory
+      .filter(s => s.status !== 'tracking')
+      .map(s => s.id)
+  );
+
+  // Prune Pro/Premium signals[] — remove if matching history entry resolved,
+  // OR if signal is older than 7 days regardless of history match.
+  let prunedSigs = 0;
+  for (let i = signals.length - 1; i >= 0; i--) {
+    const s = signals[i];
+    const ageMs = Date.now() - new Date(s.time || s.opened_at || 0).getTime();
+    if (resolvedIds.has(s.id) || ageMs > maxAge) {
+      signals.splice(i, 1);
+      prunedSigs++;
+    }
+  }
+
+  // Prune AI signals[] — same logic
+  let prunedAi = 0;
+  for (let i = aiSignals.length - 1; i >= 0; i--) {
+    const s = aiSignals[i];
+    const ageMs = Date.now() - new Date(s.time || s.opened_at || 0).getTime();
+    if (resolvedIds.has(s.id) || ageMs > maxAge) {
+      aiSignals.splice(i, 1);
+      prunedAi++;
+    }
+  }
+
+  if (prunedSigs > 0 || prunedAi > 0) {
+    if (prunedSigs > 0) saveSignals();
+    if (prunedAi > 0) saveAiSignals();
+    console.log(`[PRUNE] Removed ${prunedSigs} institutional + ${prunedAi} AI from active feeds`);
+  }
 }
 // Run every 2 minutes
 setInterval(updateSignalHistory, 2 * 60 * 1000);
@@ -322,7 +430,7 @@ app.get('/', (req, res) => {
 
   res.json({
     status:        'SignalEdge API running',
-    version:       '7.0.0',
+    version:       '7.1.0',
     features:      ['multi-timeframe', 'smart-money', 'ai-signals', 'market-scan', 'alerts', 'sms', 'history'],
     signals:       signals.length,
     ai_signals:    aiSignals.length,
@@ -456,160 +564,20 @@ app.get('/api/signal-history', (req, res) => {
 });
 
 // ══════════════════════════════════════════
-// GET PERFORMANCE STATS
-// Returns expectancy-framed metrics for v5 frontend.
-// All derived from signalHistory entries with entry/sl/tp1/close_price/status.
-// NOTE: close_price is set at transition time (current price when status flipped),
-// which is slightly noisier than using exactly sl/tp1. Directionally correct.
+// GET PERFORMANCE STATS (win rate)
 // ══════════════════════════════════════════
 app.get('/api/performance', (req, res) => {
-  const hist = signalHistory;
-
-  // Helper: % move from entry → close_price, signed by direction
-  function pctMove(s) {
-    if (!s.entry || !s.close_price) return null;
-    const raw = ((s.close_price - s.entry) / s.entry) * 100;
-    return s.type === 'sell' ? -raw : raw;
-  }
-
-  // Helper: planned R:R from entry/sl/tp1
-  function plannedRR(s) {
-    if (!s.entry || !s.sl || !s.tp1) return null;
-    const risk   = Math.abs(s.entry - s.sl);
-    const reward = Math.abs(s.tp1 - s.entry);
-    if (risk <= 0) return null;
-    return reward / risk;
-  }
-
-  // Engine classifier: history records have `engine` = 'smart_money' | 'ai'
-  // smart_money covers both Pro (swing/day/position) and Premium (sweep/scalp).
-  // Distinguish by style: style === 'sweep' → premium, anything else → pro.
-  function engineOf(s) {
-    if (s.engine === 'ai') return 'ai';
-    if (s.engine === 'smart_money') {
-      return s.style === 'sweep' ? 'premium' : 'pro';
-    }
-    return 'other';
-  }
-
-  // Compute stats for a given subset of history records.
-  // Returns the same shape for all / pro / premium / ai.
-  function computeStats(subset) {
-    const winsArr     = subset.filter(s => s.status === 'hit_tp1');
-    const lossesArr   = subset.filter(s => s.status === 'hit_sl');
-    const expiredArr  = subset.filter(s => s.status === 'expired');
-    const trackingArr = subset.filter(s => s.status === 'tracking');
-
-    const wins    = winsArr.length;
-    const losses  = lossesArr.length;
-    const expired = expiredArr.length;
-    const tracking= trackingArr.length;
-    const closed  = wins + losses + expired;
-    const winRate = closed > 0 ? Math.round((wins / closed) * 100) : null;
-
-    const winPcts = winsArr.map(pctMove).filter(v => v !== null && isFinite(v));
-    const avgGainPct = winPcts.length
-      ? +(winPcts.reduce((a,b) => a + b, 0) / winPcts.length).toFixed(2)
-      : null;
-
-    const lossPcts = lossesArr.map(pctMove).filter(v => v !== null && isFinite(v));
-    const avgLossPct = lossPcts.length
-      ? +(lossPcts.reduce((a,b) => a + b, 0) / lossPcts.length).toFixed(2)
-      : null;
-
-    const rrs = subset.map(plannedRR).filter(v => v !== null && isFinite(v) && v > 0);
-    const avgRR = rrs.length
-      ? +(rrs.reduce((a,b) => a + b, 0) / rrs.length).toFixed(2)
-      : null;
-
-    let expectancyPct = null;
-    if (closed > 0 && avgGainPct !== null && avgLossPct !== null) {
-      const wR = wins / closed;
-      const lR = (losses + expired) / closed;
-      expectancyPct = +((wR * avgGainPct) + (lR * avgLossPct)).toFixed(2);
-    }
-
-    let bestWin = null;
-    if (winPcts.length) {
-      let bestIdx = 0, bestPct = -Infinity;
-      winsArr.forEach((s, i) => {
-        const p = pctMove(s);
-        if (p !== null && p > bestPct) { bestPct = p; bestIdx = i; }
-      });
-      const b = winsArr[bestIdx];
-      bestWin = {
-        symbol: b.symbol,
-        pct: +bestPct.toFixed(2),
-        closed_at: b.closed_at
-      };
-    }
-
-    const now = Date.now();
-    const LIVE_WINDOW_MS = 15 * 60 * 1000;
-    let live = 0, running = 0;
-    trackingArr.forEach(s => {
-      const ageMs = now - new Date(s.opened_at).getTime();
-      if (ageMs < LIVE_WINDOW_MS) live++; else running++;
-    });
-
-    const last30 = subset
-      .filter(s => s.status === 'hit_tp1' || s.status === 'hit_sl' || s.status === 'expired')
-      .slice(0, 30)
-      .reverse()
-      .map(s => {
-        if (s.status === 'hit_tp1') return 'w';
-        if (s.status === 'hit_sl')  return 'l';
-        return 'e';
-      });
-
-    return {
-      total_history: subset.length,
-      tracking, wins, losses, expired,
-      win_rate: winRate,
-      closed,
-      avg_gain_pct: avgGainPct,
-      avg_loss_pct: avgLossPct,
-      avg_rr: avgRR,
-      expectancy_pct: expectancyPct,
-      best_win: bestWin,
-      active: { total: tracking, live, running },
-      last30
-    };
-  }
-
-  // All-engines stats (legacy top-level fields)
-  const all = computeStats(hist);
-
-  // Per-engine breakdowns
-  const proHist     = hist.filter(s => engineOf(s) === 'pro');
-  const premiumHist = hist.filter(s => engineOf(s) === 'premium');
-  const aiHist      = hist.filter(s => engineOf(s) === 'ai');
-
-  const byEngine = {
-    pro:     computeStats(proHist),
-    premium: computeStats(premiumHist),
-    ai:      computeStats(aiHist)
-  };
-
+  const closed = signalHistory.filter(s => s.status === 'hit_tp1' || s.status === 'hit_sl' || s.status === 'expired');
+  const wins = closed.filter(s => s.status === 'hit_tp1').length;
+  const losses = closed.filter(s => s.status === 'hit_sl').length;
+  const expired = closed.filter(s => s.status === 'expired').length;
+  const tracking = signalHistory.filter(s => s.status === 'tracking').length;
+  const total = closed.length;
+  const winRate = total > 0 ? Math.round((wins / total) * 100) : null;
   res.json({
-    // legacy top-level fields preserved for backwards-compat with frontend
-    total_history: all.total_history,
-    tracking: all.tracking,
-    wins: all.wins,
-    losses: all.losses,
-    expired: all.expired,
-    win_rate: all.win_rate,
-    closed: all.closed,
-    avg_gain_pct: all.avg_gain_pct,
-    avg_loss_pct: all.avg_loss_pct,
-    avg_rr: all.avg_rr,
-    expectancy_pct: all.expectancy_pct,
-    best_win: all.best_win,
-    active: all.active,
-    last30: all.last30,
-    // NEW: per-engine breakdown
-    by_engine: byEngine,
-    updated_at: new Date().toISOString()
+    total_history: signalHistory.length,
+    tracking, wins, losses, expired,
+    win_rate: winRate
   });
 });
 
@@ -832,7 +800,7 @@ app.post('/webhook', webhookLimiter, async (req, res) => {
 
     signals.unshift(signal);
     if (signals.length > 100) signals.pop();
-    saveSignals();
+    saveSignals();  // PATCH v7.1: persist active feed
     stats.totalSignalsFired++;
     stats.signalsToday++;
 
@@ -944,7 +912,7 @@ app.post('/webhook-ai', webhookLimiter, async (req, res) => {
 
     aiSignals.unshift(aiSignal);
     if (aiSignals.length > 100) aiSignals.pop();
-    saveAiSignals();
+    saveAiSignals();  // PATCH v7.1: persist active feed
     stats.totalSignalsFired++;
     stats.signalsToday++;
 
@@ -996,7 +964,8 @@ app.use((err, req, res, next) => {
 // ══════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`SignalEdge API v7.0 running on port ${PORT}`);
+  console.log(`SignalEdge API v7.1 running on port ${PORT}`);
+  console.log(`v7.1: signal persistence + auto-prune resolved + pre-v5.1 cleanup`);
   console.log(`CORS allowed origin: ${ALLOWED_ORIGIN}`);
   console.log(`Finnhub:      ${FINNHUB_KEY ? '✓' : '✗'}`);
   console.log(`OneSignal:    ${ONESIGNAL_API_KEY ? '✓' : '✗'}`);
