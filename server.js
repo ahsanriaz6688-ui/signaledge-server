@@ -163,129 +163,6 @@ function loadHistory() {
 loadSubscribers();
 loadHistory();
 
-// ── Active signal persistence (Pro/Premium live feed) ──
-// PATCH v7.1: previously signals[] was in-memory only, so restarts wiped
-// the homepage. Now persisted to disk like history and subscribers.
-function saveSignals() {
-  if (!DATA_READY) return;
-  try {
-    fs.writeFileSync(SIGNALS_FILE, JSON.stringify(signals.slice(0, 50), null, 2));
-  } catch(e) { console.error('[PERSIST] Signals save failed:', e.message); }
-}
-
-function loadSignals() {
-  if (!DATA_READY) return;
-  try {
-    if (fs.existsSync(SIGNALS_FILE)) {
-      const data = JSON.parse(fs.readFileSync(SIGNALS_FILE, 'utf-8'));
-      if (Array.isArray(data)) {
-        // Drop anything older than 7 days on load
-        const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
-        const fresh = data.filter(s => {
-          const ts = new Date(s.time || s.opened_at || 0).getTime();
-          return ts > cutoff;
-        });
-        fresh.forEach(s => signals.push(s));
-        console.log(`[PERSIST] Loaded ${signals.length} active signals from disk (${data.length - fresh.length} stale dropped)`);
-      }
-    }
-  } catch(e) { console.error('[PERSIST] Signals load failed:', e.message); }
-}
-
-function saveAiSignals() {
-  if (!DATA_READY) return;
-  try {
-    fs.writeFileSync(AI_SIGNALS_FILE, JSON.stringify(aiSignals.slice(0, 100), null, 2));
-  } catch(e) { console.error('[PERSIST] AI signals save failed:', e.message); }
-}
-
-function loadAiSignals() {
-  if (!DATA_READY) return;
-  try {
-    if (fs.existsSync(AI_SIGNALS_FILE)) {
-      const data = JSON.parse(fs.readFileSync(AI_SIGNALS_FILE, 'utf-8'));
-      if (Array.isArray(data)) {
-        const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
-        const fresh = data.filter(s => {
-          const ts = new Date(s.time || s.opened_at || 0).getTime();
-          return ts > cutoff;
-        });
-        fresh.forEach(s => aiSignals.push(s));
-        console.log(`[PERSIST] Loaded ${aiSignals.length} active AI signals from disk (${data.length - fresh.length} stale dropped)`);
-      }
-    }
-  } catch(e) { console.error('[PERSIST] AI signals load failed:', e.message); }
-}
-
-loadSignals();
-loadAiSignals();
-
-// ──────────────────────────────────────────
-// PATCH v7.1 (A): One-time cleanup of pre-v5.1 broken signals
-// On startup, mark any AI signals fired before April 28 02:00 UTC
-// (the v5.1 deploy timestamp) as expired in history. These were
-// fired by the buggy bot that sold deeply oversold RSI.
-// Also wipes the active feeds clean — they'll repopulate from new scans.
-// ──────────────────────────────────────────
-(function cleanupBrokenSignals() {
-  const V51_DEPLOY_TIMESTAMP = new Date('2026-04-28T02:00:00Z').getTime();
-
-  // Mark broken AI history records as expired
-  let aiExpired = 0;
-  signalHistory.forEach(s => {
-    if (s.engine === 'ai' && s.status === 'tracking') {
-      const openedTs = new Date(s.opened_at).getTime();
-      if (openedTs < V51_DEPLOY_TIMESTAMP) {
-        s.status = 'expired';
-        s.closed_at = new Date().toISOString();
-        s.close_price = null;
-        s.cleanup_reason = 'pre_v51_broken_logic';
-        aiExpired++;
-      }
-    }
-  });
-
-  // Mark stale Pro/Premium history records as expired (>7 days, still tracking)
-  // This handles the AXS signal from April 25.
-  let instExpired = 0;
-  const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
-  signalHistory.forEach(s => {
-    if (s.engine === 'smart_money' && s.status === 'tracking') {
-      const openedTs = new Date(s.opened_at).getTime();
-      if (openedTs < sevenDaysAgo) {
-        s.status = 'expired';
-        s.closed_at = new Date().toISOString();
-        s.close_price = null;
-        s.cleanup_reason = 'stale_over_7d';
-        instExpired++;
-      }
-    }
-  });
-
-  // Prune active feeds to match
-  const beforeAi = aiSignals.length;
-  for (let i = aiSignals.length - 1; i >= 0; i--) {
-    const ts = new Date(aiSignals[i].time || aiSignals[i].opened_at || 0).getTime();
-    if (ts < V51_DEPLOY_TIMESTAMP) aiSignals.splice(i, 1);
-  }
-
-  const beforeSigs = signals.length;
-  for (let i = signals.length - 1; i >= 0; i--) {
-    const ts = new Date(signals[i].time || signals[i].opened_at || 0).getTime();
-    if (ts < sevenDaysAgo) signals.splice(i, 1);
-  }
-
-  if (aiExpired || instExpired || beforeAi !== aiSignals.length || beforeSigs !== signals.length) {
-    saveHistory();
-    saveSignals();
-    saveAiSignals();
-    console.log(`[CLEANUP] Pre-v5.1 broken AI: ${aiExpired} history + ${beforeAi - aiSignals.length} active`);
-    console.log(`[CLEANUP] Stale institutional (>7d): ${instExpired} history + ${beforeSigs - signals.length} active`);
-  } else {
-    console.log(`[CLEANUP] No stale or broken signals to clean — all good.`);
-  }
-})();
-
 function saveFundamentals() {
   if (!DATA_READY) return;
   try {
@@ -337,84 +214,55 @@ async function sendSMSBlast(message) {
 
 // ══════════════════════════════════════════
 // SIGNAL HISTORY TRACKING
-// Called periodically to update status based on current price.
-// PATCH v7.1 (B): Also prunes resolved/stale signals from active feeds
-// (signals[] and aiSignals[]). Previously the active arrays grew forever,
-// causing signals like AXS to stay "RUNNING" on the website even after
-// their history record was marked WIN/LOSS/expired.
+// Called periodically to update status based on current price
 // ══════════════════════════════════════════
 async function updateSignalHistory() {
   const tracking = signalHistory.filter(s => s.status === 'tracking');
+  if (!tracking.length) return;
 
   // Pull current prices from CoinGecko markets cache
   const cached = priceCache['_markets'];
+  if (!cached || !cached.data || !Array.isArray(cached.data.coins)) return;
+
   const priceMap = {};
-  if (cached && cached.data && Array.isArray(cached.data.coins)) {
-    cached.data.coins.forEach(c => { if (c.symbol && c.price) priceMap[c.symbol.toUpperCase()] = c.price; });
-  }
+  cached.data.coins.forEach(c => { if (c.symbol && c.price) priceMap[c.symbol.toUpperCase()] = c.price; });
 
-  const maxAge = 7 * 24 * 60 * 60 * 1000; // 7 days
-
-  // ── 1) Update history records (existing logic) ──
   for (const sig of tracking) {
     const current = priceMap[(sig.symbol || '').toUpperCase()];
-    const openedAgo = Date.now() - new Date(sig.opened_at).getTime();
+    if (!current) continue;
 
-    if (current) {
-      const isBuy = sig.type === 'buy';
-      if (isBuy) {
-        if (sig.tp1 && current >= sig.tp1) { sig.status = 'hit_tp1'; sig.closed_at = new Date().toISOString(); sig.close_price = current; }
-        else if (sig.sl && current <= sig.sl)   { sig.status = 'hit_sl'; sig.closed_at = new Date().toISOString(); sig.close_price = current; }
-      } else {
-        if (sig.tp1 && current <= sig.tp1) { sig.status = 'hit_tp1'; sig.closed_at = new Date().toISOString(); sig.close_price = current; }
-        else if (sig.sl && current >= sig.sl)   { sig.status = 'hit_sl'; sig.closed_at = new Date().toISOString(); sig.close_price = current; }
-      }
+    const isBuy = sig.type === 'buy';
+    const openedAgo = Date.now() - new Date(sig.opened_at).getTime();
+    const maxAge = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+    if (isBuy) {
+      if (sig.tp1 && current >= sig.tp1) { sig.status = 'hit_tp1'; sig.closed_at = new Date().toISOString(); sig.close_price = current; }
+      else if (sig.sl && current <= sig.sl)   { sig.status = 'hit_sl'; sig.closed_at = new Date().toISOString(); sig.close_price = current; }
+    } else {
+      if (sig.tp1 && current <= sig.tp1) { sig.status = 'hit_tp1'; sig.closed_at = new Date().toISOString(); sig.close_price = current; }
+      else if (sig.sl && current >= sig.sl)   { sig.status = 'hit_sl'; sig.closed_at = new Date().toISOString(); sig.close_price = current; }
     }
 
-    // Auto-expire after 7 days regardless of price availability
     if (sig.status === 'tracking' && openedAgo > maxAge) {
       sig.status = 'expired';
       sig.closed_at = new Date().toISOString();
-      sig.close_price = current || null;
+      sig.close_price = current;
     }
   }
   saveHistory();
 
-  // ── 2) PATCH B: Prune active feeds ──
-  // Build a Set of resolved history IDs for fast lookup
+  // PATCH v7.0.1: prune resolved signals from active feeds.
+  // Original code marked history records as resolved but never removed
+  // them from signals[] / aiSignals[]. That's why the website kept
+  // showing "RUNNING" badges on signals that had already won/lost.
   const resolvedIds = new Set(
-    signalHistory
-      .filter(s => s.status !== 'tracking')
-      .map(s => s.id)
+    signalHistory.filter(s => s.status !== 'tracking').map(s => s.id)
   );
-
-  // Prune Pro/Premium signals[] — remove if matching history entry resolved,
-  // OR if signal is older than 7 days regardless of history match.
-  let prunedSigs = 0;
   for (let i = signals.length - 1; i >= 0; i--) {
-    const s = signals[i];
-    const ageMs = Date.now() - new Date(s.time || s.opened_at || 0).getTime();
-    if (resolvedIds.has(s.id) || ageMs > maxAge) {
-      signals.splice(i, 1);
-      prunedSigs++;
-    }
+    if (resolvedIds.has(signals[i].id)) signals.splice(i, 1);
   }
-
-  // Prune AI signals[] — same logic
-  let prunedAi = 0;
   for (let i = aiSignals.length - 1; i >= 0; i--) {
-    const s = aiSignals[i];
-    const ageMs = Date.now() - new Date(s.time || s.opened_at || 0).getTime();
-    if (resolvedIds.has(s.id) || ageMs > maxAge) {
-      aiSignals.splice(i, 1);
-      prunedAi++;
-    }
-  }
-
-  if (prunedSigs > 0 || prunedAi > 0) {
-    if (prunedSigs > 0) saveSignals();
-    if (prunedAi > 0) saveAiSignals();
-    console.log(`[PRUNE] Removed ${prunedSigs} institutional + ${prunedAi} AI from active feeds`);
+    if (resolvedIds.has(aiSignals[i].id)) aiSignals.splice(i, 1);
   }
 }
 // Run every 2 minutes
@@ -430,7 +278,7 @@ app.get('/', (req, res) => {
 
   res.json({
     status:        'SignalEdge API running',
-    version:       '7.1.0',
+    version:       '7.0.1',
     features:      ['multi-timeframe', 'smart-money', 'ai-signals', 'market-scan', 'alerts', 'sms', 'history'],
     signals:       signals.length,
     ai_signals:    aiSignals.length,
@@ -800,7 +648,6 @@ app.post('/webhook', webhookLimiter, async (req, res) => {
 
     signals.unshift(signal);
     if (signals.length > 100) signals.pop();
-    saveSignals();  // PATCH v7.1: persist active feed
     stats.totalSignalsFired++;
     stats.signalsToday++;
 
@@ -912,7 +759,6 @@ app.post('/webhook-ai', webhookLimiter, async (req, res) => {
 
     aiSignals.unshift(aiSignal);
     if (aiSignals.length > 100) aiSignals.pop();
-    saveAiSignals();  // PATCH v7.1: persist active feed
     stats.totalSignalsFired++;
     stats.signalsToday++;
 
@@ -964,8 +810,8 @@ app.use((err, req, res, next) => {
 // ══════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`SignalEdge API v7.1 running on port ${PORT}`);
-  console.log(`v7.1: signal persistence + auto-prune resolved + pre-v5.1 cleanup`);
+  console.log(`SignalEdge API v7.0.1 running on port ${PORT}`);
+  console.log(`v7.0.1: prunes resolved signals from active feeds`);
   console.log(`CORS allowed origin: ${ALLOWED_ORIGIN}`);
   console.log(`Finnhub:      ${FINNHUB_KEY ? '✓' : '✗'}`);
   console.log(`OneSignal:    ${ONESIGNAL_API_KEY ? '✓' : '✗'}`);
