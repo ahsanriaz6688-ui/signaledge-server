@@ -278,7 +278,7 @@ app.get('/', (req, res) => {
 
   res.json({
     status:        'SignalEdge API running',
-    version:       '7.0.1',
+    version:       '7.0.2',
     features:      ['multi-timeframe', 'smart-money', 'ai-signals', 'market-scan', 'alerts', 'sms', 'history'],
     signals:       signals.length,
     ai_signals:    aiSignals.length,
@@ -518,11 +518,16 @@ app.post('/webhook-scan', webhookLimiter, (req, res) => {
       if (!data || typeof data !== 'object') continue;
       const signal = String(data.signal || 'hold').toLowerCase();
       if (!['buy','sell','hold'].includes(signal)) continue;
+      const rsiNum = parseFloat(data.rsi);
+      const volNum = parseFloat(data.vol_ratio);
       cleaned[String(sym).toUpperCase().substring(0, 12)] = {
         signal,
-        rsi:        Math.min(Math.max(parseFloat(data.rsi) || 50, 0), 100),
+        // PATCH v7.0.2: don't fall back to 1.0 on vol_ratio. The bot returns 0
+        // when data is unavailable; we need to preserve that signal so the
+        // frontend can render "—" instead of a misleading "1.0×".
+        rsi:        Number.isFinite(rsiNum) ? Math.min(Math.max(rsiNum, 0), 100) : 50,
         vol_surge:  !!data.vol_surge,
-        vol_ratio:  Math.min(Math.max(parseFloat(data.vol_ratio) || 1.0, 0), 50),
+        vol_ratio:  Number.isFinite(volNum) ? Math.min(Math.max(volNum, 0), 50) : 0,
         strength:   Math.min(Math.max(parseInt(data.strength) || 0, 0), 100)
       };
       count++;
@@ -810,8 +815,8 @@ app.use((err, req, res, next) => {
 // ══════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`SignalEdge API v7.0.1 running on port ${PORT}`);
-  console.log(`v7.0.1: prunes resolved signals from active feeds`);
+  console.log(`SignalEdge API v7.0.2 running on port ${PORT}`);
+  console.log(`v7.0.2: vol_ratio=0 preserved (was being clobbered to 1.0)`);
   console.log(`CORS allowed origin: ${ALLOWED_ORIGIN}`);
   console.log(`Finnhub:      ${FINNHUB_KEY ? '✓' : '✗'}`);
   console.log(`OneSignal:    ${ONESIGNAL_API_KEY ? '✓' : '✗'}`);
